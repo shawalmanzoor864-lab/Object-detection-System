@@ -1,0 +1,425 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0b1220">
+<title>Smart Path Guide – AI Obstacle Detection</title>
+<style>
+  :root{
+    --bg:#0b1220; --card:#121c33; --text:#f4f7ff; --muted:#9fb0d0;
+    --ok:#22c55e; --warn:#f59e0b; --bad:#ef4444; --accent:#3b82f6;
+  }
+  *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+  html,body{margin:0;background:var(--bg);color:var(--text);
+    font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+  body{min-height:100vh;display:flex;flex-direction:column;
+    padding:env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left)}
+  header{padding:12px 16px 4px}
+  h1{font-size:1.15rem;margin:0}
+  header p{margin:2px 0 0;color:var(--muted);font-size:.85rem}
+
+  #banner{margin:10px 12px 0;padding:16px;border-radius:16px;text-align:center;
+    background:var(--card);border:3px solid #26385f;transition:background .15s,border-color .15s}
+  #banner.clear{background:#0e2a1b;border-color:var(--ok)}
+  #banner.caution{background:#33270a;border-color:var(--warn)}
+  #banner.danger{background:#3a1212;border-color:var(--bad)}
+  #arrow{font-size:3.2rem;line-height:1}
+  #msg{font-size:1.35rem;font-weight:700;margin-top:4px}
+  #sub{font-size:.9rem;color:var(--muted);margin-top:2px}
+
+  #stage{position:relative;margin:10px 12px 0;border-radius:16px;overflow:hidden;
+    background:#000;min-height:200px}
+  #video{width:100%;display:block}
+  #overlay{position:absolute;inset:0;width:100%;height:100%}
+  #placeholder{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
+    color:var(--muted);text-align:center;padding:20px}
+
+  .controls{display:grid;grid-template-columns:1fr 1fr;gap:10px;padding:12px}
+  button{font:inherit;font-weight:700;border:0;border-radius:14px;padding:16px 10px;
+    background:var(--accent);color:#fff;font-size:1rem;cursor:pointer}
+  button.secondary{background:#1c2a4a}
+  button.stop{background:var(--bad)}
+  button.wide{grid-column:1/-1}
+  button:active{transform:scale(.98)}
+  button[aria-pressed="false"]{opacity:.55}
+
+  #list{margin:0 12px;padding:10px 14px;background:var(--card);border-radius:14px;
+    font-size:.9rem;color:var(--muted);min-height:44px}
+  footer{padding:14px 16px 20px;font-size:.75rem;color:var(--muted);text-align:center}
+  .tag{display:inline-block;padding:2px 8px;border-radius:999px;background:#1c2a4a;margin:2px 4px 2px 0;color:var(--text)}
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Smart Path Guide</h1>
+  <p>Point the phone forward. It names obstacles and tells you which way to move.</p>
+</header>
+
+<div id="banner" role="status" aria-live="polite">
+  <div id="arrow">📷</div>
+  <div id="msg">Tap Start</div>
+  <div id="sub">Camera and AI model will load</div>
+</div>
+
+<div id="stage">
+  <video id="video" playsinline muted></video>
+  <canvas id="overlay"></canvas>
+  <div id="placeholder">Camera preview will appear here</div>
+</div>
+
+<div id="list" aria-live="off">Detected objects will be listed here.</div>
+
+<div class="controls">
+  <button id="startBtn" class="wide">▶ Start Guide</button>
+  <button id="describeBtn" class="secondary">🔎 What's around me?</button>
+  <button id="langBtn" class="secondary">🌐 English</button>
+  <button id="voiceBtn" class="secondary" aria-pressed="true">🔊 Voice: On</button>
+  <button id="vibBtn" class="secondary" aria-pressed="true">📳 Vibrate: On</button>
+</div>
+
+<footer>
+  Prototype for demonstration. It is an aid, not a replacement for a white cane or other
+  mobility training. Distances are rough estimates from object size in the image.
+  Detection runs on your phone; no video is uploaded.
+</footer>
+
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3/dist/coco-ssd.min.js"></script>
+<script>
+(function(){
+  'use strict';
+
+  /* ---------- Element refs ---------- */
+  const $ = id => document.getElementById(id);
+  const video = $('video'), canvas = $('overlay'), ctx = canvas.getContext('2d');
+  const banner = $('banner'), arrowEl = $('arrow'), msgEl = $('msg'), subEl = $('sub');
+  const listEl = $('list'), placeholder = $('placeholder');
+  const startBtn = $('startBtn'), describeBtn = $('describeBtn'),
+        langBtn = $('langBtn'), voiceBtn = $('voiceBtn'), vibBtn = $('vibBtn');
+
+  /* ---------- State ---------- */
+  let model = null, stream = null, running = false;
+  let lang = 'en', voiceOn = true, vibOn = true;
+  let lastKey = '', lastSpokenAt = 0, lastLevel = 'idle';
+  let lastPreds = [];
+
+  /* ---------- Text (English / Urdu) ---------- */
+  const UR = {
+    'person':'آدمی','chair':'کرسی','car':'گاڑی','bicycle':'سائیکل','motorcycle':'موٹر سائیکل',
+    'bus':'بس','truck':'ٹرک','dog':'کتا','cat':'بلی','bench':'بینچ','dining table':'میز',
+    'couch':'صوفہ','bed':'بستر','potted plant':'پودا','bottle':'بوتل','backpack':'بیگ',
+    'suitcase':'سوٹ کیس','traffic light':'ٹریفک لائٹ','stop sign':'اسٹاپ سائن',
+    'fire hydrant':'ہائیڈرنٹ','tv':'ٹی وی','laptop':'لیپ ٹاپ','umbrella':'چھتری',
+    'cow':'گائے','horse':'گھوڑا','sheep':'بھیڑ','toilet':'ٹوائلٹ','refrigerator':'فرج',
+    'handbag':'ہینڈ بیگ','cup':'کپ','bird':'پرندہ','train':'ٹرین','boat':'کشتی'
+  };
+  const TXT = {
+    en: {
+      tap:'Tap Start', loading:'Loading AI model…', loadingSub:'First load needs internet',
+      camAsk:'Starting camera…', ready:'Guide is running', clear:'Path clear',
+      clearSub:'Keep walking carefully', stop:'Stop! Path blocked',
+      left:'Move left', right:'Move right',
+      dist:['far away','at medium distance','near','very close'],
+      ahead:'ahead', onLeft:'on your left', onRight:'on your right', inFront:'in front',
+      nothing:'Nothing detected around you.', around:'Around you: ',
+      stopped:'Guide stopped', started:'Guide started',
+      errCam:'Camera blocked. Allow camera access in browser settings.',
+      errHttps:'Camera needs HTTPS or localhost. Host this file on a secure link.',
+      errModel:'Could not load the AI model. Check your internet connection.',
+      ttsLang:'en-US', langLabel:'🌐 English', startLabel:'▶ Start Guide', stopLabel:'■ Stop Guide',
+      voiceOn:'🔊 Voice: On', voiceOff:'🔇 Voice: Off', vibOn:'📳 Vibrate: On', vibOff:'📴 Vibrate: Off'
+    },
+    ur: {
+      tap:'شروع کریں دبائیں', loading:'اے آئی ماڈل لوڈ ہو رہا ہے…', loadingSub:'پہلی بار انٹرنیٹ ضروری ہے',
+      camAsk:'کیمرہ شروع ہو رہا ہے…', ready:'گائیڈ چل رہا ہے', clear:'راستہ صاف ہے',
+      clearSub:'احتیاط سے چلتے رہیں', stop:'رکیں! راستہ بند ہے',
+      left:'بائیں طرف ہٹیں', right:'دائیں طرف ہٹیں',
+      dist:['دور','کچھ فاصلے پر','قریب','بہت قریب'],
+      ahead:'آگے', onLeft:'بائیں طرف', onRight:'دائیں طرف', inFront:'سامنے',
+      nothing:'آپ کے آس پاس کچھ نہیں ملا۔', around:'آپ کے آس پاس: ',
+      stopped:'گائیڈ بند ہو گیا', started:'گائیڈ شروع ہو گیا',
+      errCam:'کیمرہ بند ہے۔ براؤزر سیٹنگز میں اجازت دیں۔',
+      errHttps:'کیمرے کے لیے محفوظ لنک (HTTPS) ضروری ہے۔',
+      errModel:'اے آئی ماڈل لوڈ نہیں ہو سکا۔ انٹرنیٹ چیک کریں۔',
+      ttsLang:'ur-PK', langLabel:'🌐 اردو', startLabel:'▶ گائیڈ شروع کریں', stopLabel:'■ گائیڈ بند کریں',
+      voiceOn:'🔊 آواز: آن', voiceOff:'🔇 آواز: بند', vibOn:'📳 وائبریشن: آن', vibOff:'📴 وائبریشن: بند'
+    }
+  };
+  const t = () => TXT[lang];
+  const nameOf = label => (lang === 'ur' ? (UR[label] || label) : label);
+
+  /* ---------- UI helpers ---------- */
+  function setBanner(level, arrow, msg, sub){
+    banner.className = level;
+    arrowEl.textContent = arrow;
+    msgEl.textContent = msg;
+    subEl.textContent = sub || '';
+  }
+  function applyLabels(){
+    langBtn.textContent = t().langLabel;
+    startBtn.textContent = running ? t().stopLabel : t().startLabel;
+    voiceBtn.textContent = voiceOn ? t().voiceOn : t().voiceOff;
+    vibBtn.textContent = vibOn ? t().vibOn : t().vibOff;
+    document.documentElement.dir = lang === 'ur' ? 'rtl' : 'ltr';
+  }
+
+  /* ---------- Speech & vibration ---------- */
+  function speak(text, urgent){
+    if (!voiceOn || !('speechSynthesis' in window)) return;
+    if (urgent) window.speechSynthesis.cancel();
+    const u = new SpeechSynthesisUtterance(text);
+    u.lang = t().ttsLang;
+    u.rate = 1.05;
+    window.speechSynthesis.speak(u);
+  }
+  function buzz(pattern){
+    if (vibOn && navigator.vibrate) navigator.vibrate(pattern);
+  }
+
+  /* ---------- Detection analysis ---------- */
+  // Rough proximity from how big the object looks in the frame.
+  // 0 far, 1 medium, 2 near, 3 very close
+  function proximity(b, vw, vh){
+    const hr = b[3] / vh;
+    const ar = (b[2] * b[3]) / (vw * vh);
+    const s = Math.max(hr, Math.sqrt(ar) * 1.1);
+    if (s > 0.65) return 3;
+    if (s > 0.40) return 2;
+    if (s > 0.20) return 1;
+    return 0;
+  }
+
+  function analyze(preds){
+    const vw = video.videoWidth, vh = video.videoHeight;
+    const L = vw * 0.30, R = vw * 0.70; // walking corridor = middle 40%
+    const objs = preds.map(p => {
+      const [x, y, w, h] = p.bbox;
+      return {
+        label: p.class, score: p.score, box: p.bbox,
+        prox: proximity(p.bbox, vw, vh),
+        x1: x, x2: x + w, cx: x + w / 2, area: w * h
+      };
+    });
+    lastPreds = objs;
+
+    // Objects blocking the walking corridor
+    const blockers = objs.filter(o => o.prox >= 1 && o.x2 > L && o.x1 < R);
+    renderList(objs);
+
+    if (blockers.length === 0){
+      drawOverlay(objs, null);
+      if (lastLevel !== 'clear'){
+        setBanner('clear', '⬆️', t().clear, t().clearSub);
+        if (lastLevel === 'danger' || lastLevel === 'caution' || lastLevel === 'idle'){
+          speak(t().clear, false);
+        }
+        lastLevel = 'clear'; lastKey = 'clear';
+      }
+      return;
+    }
+
+    blockers.sort((a, b) => b.prox - a.prox || b.area - a.area);
+    const main = blockers[0];
+
+    // How blocked is each side?
+    const sideScore = (from, to) => objs.reduce((m, o) =>
+      (o.prox >= 1 && o.x2 > from && o.x1 < to) ? Math.max(m, o.prox) : m, 0);
+    const leftScore = sideScore(0, L);
+    const rightScore = sideScore(R, vw);
+
+    let dir; // 'left' | 'right' | 'stop'
+    if (leftScore >= 2 && rightScore >= 2) dir = 'stop';
+    else if (leftScore < rightScore) dir = 'left';
+    else if (rightScore < leftScore) dir = 'right';
+    else dir = main.cx < vw / 2 ? 'right' : 'left'; // go away from the object
+
+    const level = (main.prox >= 2) ? 'danger' : 'caution';
+    const arrow = dir === 'left' ? '⬅️' : dir === 'right' ? '➡️' : '🛑';
+    const dirText = dir === 'stop' ? t().stop : (dir === 'left' ? t().left : t().right);
+    const nm = nameOf(main.label);
+    const dw = t().dist[main.prox];
+
+    const spoken = (lang === 'ur')
+      ? `${nm} ${t().ahead}، ${dw}۔ ${dirText}۔`
+      : `${nm} ${dw} ahead. ${dirText}.`;
+
+    setBanner(level, arrow, dirText, `${nm} · ${dw}`);
+    drawOverlay(objs, main);
+
+    const key = `${main.label}|${main.prox}|${dir}`;
+    const now = Date.now();
+    const changed = key !== lastKey;
+    if ((changed && now - lastSpokenAt > 1200) || now - lastSpokenAt > 5000){
+      speak(spoken, main.prox >= 2);
+      lastSpokenAt = now;
+      if (dir === 'left') buzz([220]);
+      else if (dir === 'right') buzz([90, 70, 90]);
+      else buzz([400, 120, 400]);
+    }
+    lastKey = key; lastLevel = level;
+  }
+
+  /* ---------- Drawing ---------- */
+  function drawOverlay(objs, main){
+    const vw = canvas.width, vh = canvas.height;
+    ctx.clearRect(0, 0, vw, vh);
+
+    // walking corridor guides
+    ctx.strokeStyle = 'rgba(255,255,255,.55)';
+    ctx.setLineDash([10, 10]); ctx.lineWidth = Math.max(2, vw / 300);
+    ctx.beginPath();
+    ctx.moveTo(vw * 0.30, 0); ctx.lineTo(vw * 0.30, vh);
+    ctx.moveTo(vw * 0.70, 0); ctx.lineTo(vw * 0.70, vh);
+    ctx.stroke(); ctx.setLineDash([]);
+
+    const colors = ['#22c55e', '#f59e0b', '#f97316', '#ef4444'];
+    const fs = Math.max(14, Math.round(vw / 28));
+    ctx.font = `700 ${fs}px system-ui, sans-serif`;
+    ctx.textBaseline = 'top';
+
+    objs.forEach(o => {
+      const [x, y, w, h] = o.box;
+      const c = colors[o.prox];
+      ctx.lineWidth = o === main ? Math.max(5, vw / 120) : Math.max(3, vw / 200);
+      ctx.strokeStyle = c;
+      ctx.strokeRect(x, y, w, h);
+      const label = o.label + ' ' + Math.round(o.score * 100) + '%';
+      const tw = ctx.measureText(label).width + 12;
+      ctx.fillStyle = c;
+      ctx.fillRect(x, Math.max(0, y - fs - 6), tw, fs + 6);
+      ctx.fillStyle = '#000';
+      ctx.fillText(label, x + 6, Math.max(0, y - fs - 6) + 3);
+    });
+  }
+
+  function renderList(objs){
+    if (!objs.length){ listEl.textContent = t().nothing; return; }
+    listEl.innerHTML = '';
+    objs.slice(0, 8).forEach(o => {
+      const span = document.createElement('span');
+      span.className = 'tag';
+      span.textContent = `${nameOf(o.label)} · ${t().dist[o.prox]}`;
+      listEl.appendChild(span);
+    });
+  }
+
+  /* ---------- "What's around me?" ---------- */
+  function describeAround(){
+    const vw = video.videoWidth || 1;
+    if (!running){ speak(t().tap, true); return; }
+    if (!lastPreds.length){ speak(t().nothing, true); return; }
+    const parts = lastPreds
+      .slice().sort((a, b) => b.prox - a.prox).slice(0, 6)
+      .map(o => {
+        const where = o.cx < vw * 0.33 ? t().onLeft : o.cx > vw * 0.67 ? t().onRight : t().inFront;
+        return `${nameOf(o.label)} ${where}, ${t().dist[o.prox]}`;
+      });
+    speak(t().around + parts.join(lang === 'ur' ? '، ' : '; '), true);
+  }
+
+  /* ---------- Main loop ---------- */
+  async function loop(){
+    if (!running) return;
+    const t0 = performance.now();
+    try{
+      if (video.readyState >= 2){
+        const preds = await model.detect(video, 10, 0.5);
+        analyze(preds);
+      }
+    }catch(e){ console.error(e); }
+    const dt = performance.now() - t0;
+    setTimeout(() => requestAnimationFrame(loop), Math.max(0, 100 - dt));
+  }
+
+  async function start(){
+    startBtn.disabled = true;
+    try{
+      if (!window.isSecureContext){
+        setBanner('danger', '⚠️', t().errHttps, '');
+        startBtn.disabled = false; return;
+      }
+      setBanner('caution', '⏳', t().loading, t().loadingSub);
+      if (!model){
+        try{
+          await tf.ready();
+          model = await cocoSsd.load({ base: 'lite_mobilenet_v2' });
+        }catch(e){
+          console.error(e);
+          setBanner('danger', '⚠️', t().errModel, '');
+          startBtn.disabled = false; return;
+        }
+      }
+      setBanner('caution', '📷', t().camAsk, '');
+      try{
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: { ideal: 'environment' }, width: { ideal: 640 }, height: { ideal: 480 } },
+          audio: false
+        });
+      }catch(e){
+        console.error(e);
+        setBanner('danger', '⚠️', t().errCam, '');
+        startBtn.disabled = false; return;
+      }
+      video.srcObject = stream;
+      await video.play();
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+      placeholder.style.display = 'none';
+      running = true; lastKey = ''; lastLevel = 'idle'; lastSpokenAt = 0;
+      setBanner('clear', '✅', t().ready, '');
+      speak(t().started, true);
+      applyLabels();
+      loop();
+    } finally {
+      startBtn.disabled = false;
+    }
+  }
+
+  function stop(){
+    running = false;
+    if (stream){ stream.getTracks().forEach(tr => tr.stop()); stream = null; }
+    video.srcObject = null;
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    placeholder.style.display = 'flex';
+    setBanner('', '📷', t().stopped, '');
+    listEl.textContent = '';
+    if ('speechSynthesis' in window) window.speechSynthesis.cancel();
+    applyLabels();
+  }
+
+  /* ---------- Buttons ---------- */
+  startBtn.addEventListener('click', () => running ? stop() : start());
+  describeBtn.addEventListener('click', describeAround);
+  langBtn.addEventListener('click', () => {
+    lang = lang === 'en' ? 'ur' : 'en';
+    applyLabels();
+    if (!running) setBanner('', '📷', t().tap, '');
+    if (lang === 'ur' && 'speechSynthesis' in window){
+      const hasUr = speechSynthesis.getVoices().some(v => /^ur/i.test(v.lang));
+      if (!hasUr) subEl.textContent = 'Urdu voice may be missing: install it in your phone’s Text-to-speech settings.';
+    }
+  });
+  voiceBtn.addEventListener('click', () => {
+    voiceOn = !voiceOn;
+    voiceBtn.setAttribute('aria-pressed', String(voiceOn));
+    if (!voiceOn && 'speechSynthesis' in window) speechSynthesis.cancel();
+    applyLabels();
+  });
+  vibBtn.addEventListener('click', () => {
+    vibOn = !vibOn;
+    vibBtn.setAttribute('aria-pressed', String(vibOn));
+    applyLabels();
+    if (vibOn) buzz([80]);
+  });
+
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden && running) stop();
+  });
+
+  applyLabels();
+})();
+</script>
+</body>
+</html>
